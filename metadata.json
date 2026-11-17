@@ -1,0 +1,6 @@
+{
+  "name": "DubMux Studio — YouTube Multi-Audio Downloader",
+  "description": "Single-file Python CustomTkinter desktop application and interactive workflow studio for downloading YouTube videos with specific multi-language dubbed audio tracks merged via yt-dlp and FFmpeg.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
