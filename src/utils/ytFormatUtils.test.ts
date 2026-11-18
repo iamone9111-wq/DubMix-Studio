@@ -2,9 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   buildYdlMergeOptions,
+  formatBytesSize,
   formatDuration,
   isBotCheckError,
   parseAudioDubs,
+  parseByteRange,
   parseVideoFormats,
   parseYdlProgressLine,
   SAMPLE_VIDEOS,
@@ -66,4 +68,19 @@ test('sanitizeNetscapeCookies validates tab-delimited Netscape cookie rows', () 
   const normalized = sanitizeNetscapeCookies(valid);
   assert.ok(normalized?.startsWith('# Netscape HTTP Cookie File\n'));
   assert.equal(sanitizeNetscapeCookies('not a cookie file'), null);
+});
+
+test('parseByteRange parses explicit, open-ended, and invalid ranges accurately', () => {
+  assert.deepEqual(parseByteRange('bytes=0-1023', 5000), {
+    start: 0,
+    end: 1023,
+    length: 1024,
+  });
+  assert.deepEqual(parseByteRange('bytes=4000-9999', 5000), {
+    start: 4000,
+    end: 4999,
+    length: 1000,
+  });
+  assert.equal(parseByteRange('bytes=6000-7000', 5000), null);
+  assert.equal(formatBytesSize(15 * 1024 * 1024), '15.0 MB');
 });

@@ -1,10 +1,16 @@
 import { useEffect, useRef, useState } from 'react';
 import { Download, Film, FolderOpen, Languages, Search } from 'lucide-react';
-import { formatDuration, ParsedStreamOption, SAMPLE_VIDEOS } from '../utils/ytFormatUtils';
+import {
+  formatBytesSize,
+  formatDuration,
+  ParsedStreamOption,
+  SAMPLE_VIDEOS,
+} from '../utils/ytFormatUtils';
 
 type AppPhase = 'idle' | 'fetching' | 'ready' | 'downloading' | 'merging' | 'completed' | 'error';
 
 const STUDIO_THUMBNAIL = '/src/assets/images/dubmix_studio_thumbnail_1794883955957.jpg';
+const DOWNLOAD_CHUNK_BYTES = 8 * 1024 * 1024;
 
 interface InfoApiResponse {
   title?: string;
@@ -25,7 +31,51 @@ interface JobStatusResponse {
   statusLine: string;
   downloadReady: boolean;
   fileName: string | null;
+  fileSize?: number | null;
   error: string | null;
+}
+
+function triggerAnchorDownload(href: string, fileName: string) {
+  const anchor = document.createElement('a');
+  anchor.href = href;
+  anchor.download = fileName;
+  anchor.rel = 'noopener';
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+}
+
+async function fetchRangeChunkWithRetry(
+  fileUrl: string,
+  start: number,
+  end: number,
+  maxRetries = 3,
+): Promise<{ status: number; contentRange: string | null; buffer: ArrayBuffer }> {
+  let lastError: Error | null = null;
+  for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+    try {
+      const response = await fetch(fileUrl, {
+        headers: {
+          Range: `bytes=${start}-${end}`,
+        },
+      });
+      if (response.status !== 200 && response.status !== 206) {
+        throw new Error(`HTTP ${response.status} while transferring MP4 chunk.`);
+      }
+      const buffer = await response.arrayBuffer();
+      return {
+        status: response.status,
+        contentRange: response.headers.get('Content-Range'),
+        buffer,
+      };
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error('Chunk transfer failed.');
+      if (attempt < maxRetries) {
+        await new Promise((resolve) => window.setTimeout(resolve, 350 * (attempt + 1)));
+      }
+    }
+  }
+  throw lastError ?? new Error('Chunk transfer failed.');
 }
 
 export function DesktopSimulator() {
@@ -48,14 +98,20 @@ export function DesktopSimulator() {
   const [speedLabel, setSpeedLabel] = useState('-- MB/s');
   const [etaLabel, setEtaLabel] = useState('--:--');
   const [completedFileUrl, setCompletedFileUrl] = useState<string | null>(null);
+  const [completedApiUrl, setCompletedApiUrl] = useState<string | null>(null);
   const [completedFileName, setCompletedFileName] = useState<string | null>(null);
+  const [completedFileSize, setCompletedFileSize] = useState<number | null>(null);
 
   const pollTimerRef = useRef<number | null>(null);
+  const completedBlobUrlRef = useRef<string | null>(null);
 
   useEffect(() => {
     return () => {
       if (pollTimerRef.current !== null) {
         window.clearInterval(pollTimerRef.current);
+      }
+      if (completedBlobUrlRef.current?.startsWith('blob:')) {
+        URL.revokeObjectURL(completedBlobUrlRef.current);
       }
     };
   }, []);
@@ -67,29 +123,114 @@ export function DesktopSimulator() {
     }
   };
 
-  const triggerBrowserDownload = async (fileUrl: string, fileName: string) => {
+  const clearCompletedDownload = () => {
+    if (completedBlobUrlRef.current?.startsWith('blob:')) {
+      URL.revokeObjectURL(completedBlobUrlRef.current);
+      completedBlobUrlRef.current = null;
+    }
+    setCompletedFileUrl(null);
+    setCompletedApiUrl(null);
+    setCompletedFileName(null);
+    setCompletedFileSize(null);
+  };
+
+  const triggerBrowserDownload = async (
+    fileUrl: string,
+    fileName: string,
+    knownFileSize?: number | null,
+  ) => {
     try {
-      const response = await fetch(fileUrl);
-      if (!response.ok) {
-        throw new Error('Download endpoint returned an error.');
+      const chunks: BlobPart[] = [];
+      let totalBytes = knownFileSize && knownFileSize > 0 ? knownFileSize : 0;
+      let offset = 0;
+
+      while (totalBytes === 0 || offset < totalBytes) {
+        const requestedEnd =
+          totalBytes > 0
+            ? Math.min(offset + DOWNLOAD_CHUNK_BYTES - 1, totalBytes - 1)
+            : offset + DOWNLOAD_CHUNK_BYTES - 1;
+
+        const { status, contentRange, buffer } = await fetchRangeChunkWithRetry(
+          fileUrl,
+          offset,
+          requestedEnd,
+        );
+
+        if (buffer.byteLength === 0) {
+          throw new Error('Server returned an empty MP4 chunk.');
+        }
+
+        chunks.push(new Uint8Array(buffer));
+
+        if (status === 200) {
+          totalBytes = buffer.byteLength;
+          offset = buffer.byteLength;
+          break;
+        }
+
+        if (contentRange) {
+          const match = /bytes\s+\d+-\d+\/(\d+)/i.exec(contentRange);
+          if (match) {
+            totalBytes = Number.parseInt(match[1], 10);
+          }
+        }
+
+        offset += buffer.byteLength;
+
+        if (totalBytes > DOWNLOAD_CHUNK_BYTES) {
+          const pct = Math.min(99, Math.round((offset / totalBytes) * 100));
+          setProgress(pct);
+          setStatusLine(
+            `Transferring MP4 to browser: ${pct}% (${formatBytesSize(offset)} / ${formatBytesSize(totalBytes)})`,
+          );
+        }
+
+        if (totalBytes === 0) {
+          break;
+        }
       }
-      const blob = await response.blob();
+
+      const blob = new Blob(chunks, { type: 'video/mp4' });
       const blobUrl = URL.createObjectURL(blob);
+      if (completedBlobUrlRef.current?.startsWith('blob:')) {
+        URL.revokeObjectURL(completedBlobUrlRef.current);
+      }
+      completedBlobUrlRef.current = blobUrl;
       setCompletedFileUrl(blobUrl);
-      const anchor = document.createElement('a');
-      anchor.href = blobUrl;
-      anchor.download = fileName;
-      anchor.rel = 'noopener';
-      document.body.appendChild(anchor);
-      anchor.click();
-      anchor.remove();
-    } catch {
-      const anchor = document.createElement('a');
-      anchor.href = fileUrl;
-      anchor.download = fileName;
-      document.body.appendChild(anchor);
-      anchor.click();
-      anchor.remove();
+      triggerAnchorDownload(blobUrl, fileName);
+      setPhase('completed');
+      setProgress(100);
+      setSpeedLabel('-- MB/s');
+      setEtaLabel('00:00');
+      setStatusLine(`Completed! Merged MP4 saved (${fileName}).`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Browser transfer interrupted.';
+      if (!knownFileSize || knownFileSize <= DOWNLOAD_CHUNK_BYTES) {
+        triggerAnchorDownload(fileUrl, fileName);
+        setPhase('completed');
+        setProgress(100);
+        setStatusLine(`Completed! Merged MP4 ready (${fileName}).`);
+        return;
+      }
+      setPhase('error');
+      setErrorMessage(`${msg} Click "Save MP4 again" to resume.`);
+      setStatusLine(`${msg} Click "Save MP4 again" to resume.`);
+    }
+  };
+
+  const handleSaveAgain = async () => {
+    if (!completedFileName) {
+      return;
+    }
+    if (completedFileUrl?.startsWith('blob:')) {
+      triggerAnchorDownload(completedFileUrl, completedFileName);
+      return;
+    }
+    if (completedApiUrl) {
+      setErrorMessage('');
+      setPhase('downloading');
+      setStatusLine(`Resuming MP4 transfer (${completedFileName})...`);
+      await triggerBrowserDownload(completedApiUrl, completedFileName, completedFileSize);
     }
   };
 
@@ -104,11 +245,7 @@ export function DesktopSimulator() {
     }
 
     setErrorMessage('');
-    if (completedFileUrl?.startsWith('blob:')) {
-      URL.revokeObjectURL(completedFileUrl);
-    }
-    setCompletedFileUrl(null);
-    setCompletedFileName(null);
+    clearCompletedDownload();
     setPhase('fetching');
     setProgress(0);
     setSpeedLabel('-- MB/s');
@@ -171,11 +308,7 @@ export function DesktopSimulator() {
     }
     stopPolling();
     setErrorMessage('');
-    if (completedFileUrl?.startsWith('blob:')) {
-      URL.revokeObjectURL(completedFileUrl);
-    }
-    setCompletedFileUrl(null);
-    setCompletedFileName(null);
+    clearCompletedDownload();
     setPhase('downloading');
     setProgress(0);
     setSpeedLabel('-- MB/s');
@@ -222,12 +355,13 @@ export function DesktopSimulator() {
 
           if (job.phase === 'completed') {
             stopPolling();
-            setPhase('completed');
             const fileUrl = `/api/download/${jobId}/file`;
             const fileName = job.fileName || 'video.mp4';
-            setCompletedFileUrl(fileUrl);
+            const fileSize = job.fileSize ?? null;
+            setCompletedApiUrl(fileUrl);
             setCompletedFileName(fileName);
-            await triggerBrowserDownload(fileUrl, fileName);
+            setCompletedFileSize(fileSize);
+            await triggerBrowserDownload(fileUrl, fileName, fileSize);
           } else if (job.phase === 'error') {
             stopPolling();
             setPhase('error');
@@ -445,14 +579,15 @@ export function DesktopSimulator() {
           >
             {errorMessage || statusLine}
           </p>
-          {completedFileUrl && completedFileName && (
-            <a
-              href={completedFileUrl}
-              download={completedFileName}
-              className="text-xs font-medium text-sky-400 underline-offset-4 hover:underline whitespace-nowrap shrink-0"
+          {(completedFileUrl || completedApiUrl) && completedFileName && (
+            <button
+              type="button"
+              onClick={() => void handleSaveAgain()}
+              disabled={isBusy}
+              className="text-xs font-medium text-sky-400 underline-offset-4 hover:underline disabled:opacity-50 whitespace-nowrap shrink-0"
             >
               Save MP4 again
-            </a>
+            </button>
           )}
         </div>
       </div>

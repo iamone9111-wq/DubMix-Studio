@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
@@ -8,6 +9,7 @@ import {
   findExactSampleByUrl,
   isBotCheckError,
   parseAudioDubs,
+  parseByteRange,
   parseVideoFormats,
   parseYdlProgressLine,
   type RawStreamFormat,
@@ -24,10 +26,34 @@ interface DownloadJob {
   statusLine: string;
   filePath?: string;
   fileName?: string;
+  fileSize?: number;
   error?: string;
 }
 
-const PORT = Number(process.env.PORT) || 3000;
+const JOB_ID_PATTERN = /^[a-f0-9]{16}$/;
+const MAX_RANGE_CHUNK_BYTES = 8 * 1024 * 1024;
+
+function resolveServerPort(argv: string[]): number {
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg.startsWith('--port=')) {
+      const parsed = Number.parseInt(arg.slice('--port='.length), 10);
+      if (Number.isFinite(parsed) && parsed > 0) {
+        return parsed;
+      }
+    }
+    if (arg === '--port' && i + 1 < argv.length) {
+      const parsed = Number.parseInt(argv[i + 1], 10);
+      if (Number.isFinite(parsed) && parsed > 0) {
+        return parsed;
+      }
+    }
+  }
+  const envPort = Number(process.env.PORT);
+  return Number.isFinite(envPort) && envPort > 0 ? envPort : 3000;
+}
+
+const PORT = resolveServerPort(process.argv.slice(2));
 const DOWNLOADS_ROOT = path.join(os.tmpdir(), 'dubmux-downloads');
 const COOKIES_ROOT = path.join(os.tmpdir(), 'dubmux-cookies');
 fs.mkdirSync(DOWNLOADS_ROOT, { recursive: true });
@@ -92,8 +118,70 @@ async function fetchOembedInfo(url: string): Promise<{
 }
 
 function sanitizeFilename(input: string): string {
-  const cleaned = input.replace(/[<>:"/\\|?*\x00-\x1F]/g, '').trim();
-  return (cleaned || 'video').slice(0, 72);
+  const cleaned = input
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return (cleaned || 'video').slice(0, 96);
+}
+
+function getJobMetaPath(jobId: string): string {
+  return path.join(DOWNLOADS_ROOT, jobId, 'meta.json');
+}
+
+function persistJobToDisk(job: DownloadJob): void {
+  try {
+    const jobDir = path.join(DOWNLOADS_ROOT, job.id);
+    fs.mkdirSync(jobDir, { recursive: true });
+    fs.writeFileSync(getJobMetaPath(job.id), JSON.stringify(job), 'utf8');
+  } catch {
+    // Non-fatal persistence safeguard
+  }
+}
+
+function loadJobFromDisk(jobId: string): DownloadJob | null {
+  if (!JOB_ID_PATTERN.test(jobId)) {
+    return null;
+  }
+  const existing = jobs.get(jobId);
+  if (existing) {
+    return existing;
+  }
+  const metaPath = getJobMetaPath(jobId);
+  try {
+    if (fs.existsSync(metaPath)) {
+      const parsed = JSON.parse(fs.readFileSync(metaPath, 'utf8')) as DownloadJob;
+      if (parsed && parsed.id === jobId) {
+        jobs.set(jobId, parsed);
+        return parsed;
+      }
+    }
+    const jobDir = path.join(DOWNLOADS_ROOT, jobId);
+    if (fs.existsSync(jobDir)) {
+      const mp4Name = fs.readdirSync(jobDir).find((name) => name.toLowerCase().endsWith('.mp4'));
+      if (mp4Name) {
+        const filePath = path.join(jobDir, mp4Name);
+        const stat = fs.statSync(filePath);
+        const safeName = `${sanitizeFilename(mp4Name.replace(/\.mp4$/i, ''))}.mp4`;
+        const recovered: DownloadJob = {
+          id: jobId,
+          phase: 'completed',
+          progress: 100,
+          speedLabel: '-- MB/s',
+          etaLabel: '00:00',
+          statusLine: `Completed! Merged MP4 ready (${safeName}).`,
+          filePath,
+          fileName: safeName,
+          fileSize: stat.size,
+        };
+        jobs.set(jobId, recovered);
+        return recovered;
+      }
+    }
+  } catch {
+    return null;
+  }
+  return null;
 }
 
 function isYtdlpUnavailableError(message: string): boolean {
@@ -202,6 +290,7 @@ function startFfmpegMuxJob(
       job.speedLabel = '-- MB/s';
       job.etaLabel = '00:00';
       job.statusLine = 'Stream downloaded. Merging video & dubbed audio via FFmpeg...';
+      persistJobToDisk(job);
 
       const ff = spawn(
         'ffmpeg',
@@ -234,19 +323,24 @@ function startFfmpegMuxJob(
         job.phase = 'error';
         job.error = `FFmpeg failed to start: ${err.message}`;
         job.statusLine = job.error;
+        persistJobToDisk(job);
       });
 
       ff.on('close', (code) => {
         if (code === 0 && fs.existsSync(outFile)) {
+          const stat = fs.statSync(outFile);
           job.phase = 'completed';
           job.progress = 100;
           job.filePath = outFile;
           job.fileName = path.basename(outFile);
+          job.fileSize = stat.size;
           job.statusLine = `Completed! Merged MP4 ready (${job.fileName}).`;
+          persistJobToDisk(job);
         } else {
           job.phase = 'error';
           job.error = ffErr.trim() || 'FFmpeg muxing failed.';
           job.statusLine = job.error;
+          persistJobToDisk(job);
         }
       });
     }
@@ -310,6 +404,7 @@ function startYtdlpDownloadJob(
       job.speedLabel = '-- MB/s';
       job.etaLabel = '00:00';
       job.statusLine = 'Stream downloaded. Merging video & dubbed audio via FFmpeg...';
+      persistJobToDisk(job);
     }
   };
 
@@ -342,15 +437,21 @@ function startYtdlpDownloadJob(
       processLine(stdoutBuf);
     }
     if (code === 0) {
-      const files = fs.readdirSync(jobDir).filter((name) => name.endsWith('.mp4'));
-      const fallbackFiles = files.length > 0 ? files : fs.readdirSync(jobDir);
+      const files = fs.readdirSync(jobDir).filter((name) => name.toLowerCase().endsWith('.mp4'));
+      const fallbackFiles =
+        files.length > 0 ? files : fs.readdirSync(jobDir).filter((name) => name !== 'meta.json');
       const outputName = fallbackFiles[0];
       if (outputName) {
+        const outputPath = path.join(jobDir, outputName);
+        const stat = fs.statSync(outputPath);
+        const safeName = `${sanitizeFilename(outputName.replace(/\.mp4$/i, ''))}.mp4`;
         job.phase = 'completed';
         job.progress = 100;
-        job.filePath = path.join(jobDir, outputName);
-        job.fileName = outputName;
-        job.statusLine = `Completed! Merged MP4 ready (${outputName}).`;
+        job.filePath = outputPath;
+        job.fileName = safeName;
+        job.fileSize = stat.size;
+        job.statusLine = `Completed! Merged MP4 ready (${safeName}).`;
+        persistJobToDisk(job);
         return;
       }
     }
@@ -374,6 +475,7 @@ function startYtdlpDownloadJob(
     job.phase = 'error';
     job.error = cleanErr;
     job.statusLine = `Download failed: ${cleanErr}`;
+    persistJobToDisk(job);
   });
 }
 
@@ -477,6 +579,7 @@ async function createServer() {
       statusLine: `Starting download (${videoFormatId}+${audioFormatId})...`,
     };
     jobs.set(id, job);
+    persistJobToDisk(job);
 
     if (isCloudFallback) {
       startFfmpegMuxJob(job, title, videoFormatId, audioFormatId);
@@ -488,33 +591,111 @@ async function createServer() {
   });
 
   app.get('/api/download/:jobId', (req, res) => {
-    const job = jobs.get(req.params.jobId);
+    const job = loadJobFromDisk(req.params.jobId);
     if (!job) {
       res.status(404).json({ error: 'Download job not found.' });
       return;
     }
+    const fileExists = Boolean(job.filePath && fs.existsSync(job.filePath));
+    const fileSize =
+      job.phase === 'completed' && fileExists && job.filePath
+        ? fs.statSync(job.filePath).size
+        : (job.fileSize ?? null);
+
     res.json({
       phase: job.phase,
       progress: job.progress,
       speedLabel: job.speedLabel,
       etaLabel: job.etaLabel,
       statusLine: job.statusLine,
-      downloadReady: job.phase === 'completed' && Boolean(job.filePath),
+      downloadReady: job.phase === 'completed' && fileExists,
       fileName: job.fileName ?? null,
+      fileSize,
       error: job.error ?? null,
     });
   });
 
   app.get('/api/download/:jobId/file', (req, res) => {
-    const job = jobs.get(req.params.jobId);
+    const job = loadJobFromDisk(req.params.jobId);
     if (!job || job.phase !== 'completed' || !job.filePath || !fs.existsSync(job.filePath)) {
       res.status(404).json({ error: 'Merged MP4 file is not ready.' });
       return;
     }
-    const safeDownloadName = sanitizeFilename((job.fileName || 'video.mp4').replace(/\.mp4$/i, '')) + '.mp4';
+
+    const stat = fs.statSync(job.filePath);
+    const fileSize = stat.size;
+    const safeDownloadName =
+      sanitizeFilename((job.fileName || 'video.mp4').replace(/\.mp4$/i, '')) + '.mp4';
+    const asciiFallback = safeDownloadName.replace(/[^\x20-\x7E]/g, '_').replace(/["\\]/g, '_');
+    const encodedName = encodeURIComponent(safeDownloadName);
+
     res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Content-Disposition', `attachment; filename="${safeDownloadName}"`);
-    res.sendFile(job.filePath);
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="${asciiFallback}"; filename*=UTF-8''${encodedName}`,
+    );
+
+    const rangeHeader = typeof req.headers.range === 'string' ? req.headers.range : undefined;
+    if (rangeHeader) {
+      const parsedRange = parseByteRange(rangeHeader, fileSize, MAX_RANGE_CHUNK_BYTES);
+      if (!parsedRange) {
+        res.status(416);
+        res.setHeader('Content-Range', `bytes */${fileSize}`);
+        res.end();
+        return;
+      }
+
+      res.status(206);
+      res.setHeader('Content-Range', `bytes ${parsedRange.start}-${parsedRange.end}/${fileSize}`);
+      res.setHeader('Content-Length', String(parsedRange.length));
+      if (req.method === 'HEAD') {
+        res.end();
+        return;
+      }
+
+      const stream = fs.createReadStream(job.filePath, {
+        start: parsedRange.start,
+        end: parsedRange.end,
+      });
+      stream.on('error', () => {
+        if (!res.headersSent) {
+          res.status(500).json({ error: 'Failed to read MP4 chunk.' });
+        } else {
+          res.destroy();
+        }
+      });
+      res.on('close', () => {
+        if (!stream.destroyed) {
+          stream.destroy();
+        }
+      });
+      stream.pipe(res);
+      return;
+    }
+
+    res.status(200);
+    res.setHeader('Content-Length', String(fileSize));
+    if (req.method === 'HEAD') {
+      res.end();
+      return;
+    }
+
+    const stream = fs.createReadStream(job.filePath);
+    stream.on('error', () => {
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Failed to stream MP4 file.' });
+      } else {
+        res.destroy();
+      }
+    });
+    res.on('close', () => {
+      if (!stream.destroyed) {
+        stream.destroy();
+      }
+    });
+    stream.pipe(res);
   });
 
   if (process.env.NODE_ENV !== 'production') {

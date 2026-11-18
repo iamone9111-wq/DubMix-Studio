@@ -310,3 +310,69 @@ export function sanitizeNetscapeCookies(rawText: string): string | null {
   }
   return `${lines.join('\n')}\n`;
 }
+
+export interface ByteRange {
+  start: number;
+  end: number;
+  length: number;
+}
+
+export function parseByteRange(
+  rangeHeader: string | undefined,
+  fileSize: number,
+  maxChunkBytes = 8 * 1024 * 1024,
+): ByteRange | null {
+  if (!rangeHeader || fileSize <= 0) {
+    return null;
+  }
+  const match = /^bytes=(\d*)-(\d*)$/i.exec(rangeHeader.trim());
+  if (!match) {
+    return null;
+  }
+  const [, startStr, endStr] = match;
+  if (!startStr && !endStr) {
+    return null;
+  }
+
+  let start: number;
+  let end: number;
+
+  if (startStr && endStr) {
+    start = Number.parseInt(startStr, 10);
+    end = Math.min(Number.parseInt(endStr, 10), fileSize - 1);
+  } else if (startStr) {
+    start = Number.parseInt(startStr, 10);
+    end = Math.min(start + maxChunkBytes - 1, fileSize - 1);
+  } else {
+    const suffix = Number.parseInt(endStr, 10);
+    if (suffix <= 0) {
+      return null;
+    }
+    start = Math.max(0, fileSize - suffix);
+    end = fileSize - 1;
+  }
+
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || start > end || end >= fileSize) {
+    return null;
+  }
+
+  return {
+    start,
+    end,
+    length: end - start + 1,
+  };
+}
+
+export function formatBytesSize(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return '0 B';
+  }
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let val = bytes;
+  let idx = 0;
+  while (val >= 1024 && idx < units.length - 1) {
+    val /= 1024;
+    idx += 1;
+  }
+  return `${val.toFixed(idx === 0 ? 0 : 1)} ${units[idx]}`;
+}
