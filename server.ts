@@ -10,10 +10,10 @@ import {
   parseAudioDubs,
   parseVideoFormats,
   parseYdlProgressLine,
-  RawStreamFormat,
+  type RawStreamFormat,
   SAMPLE_VIDEOS,
   sanitizeNetscapeCookies,
-} from './src/utils/ytFormatUtils';
+} from './src/utils/ytFormatUtils.ts';
 
 interface DownloadJob {
   id: string;
@@ -34,6 +34,14 @@ fs.mkdirSync(DOWNLOADS_ROOT, { recursive: true });
 fs.mkdirSync(COOKIES_ROOT, { recursive: true, mode: 0o700 });
 
 const jobs = new Map<string, DownloadJob>();
+
+function resolveYtdlpBinary(): string {
+  const localBin = path.join(process.cwd(), 'bin', 'yt-dlp');
+  if (fs.existsSync(localBin)) {
+    return localBin;
+  }
+  return 'yt-dlp';
+}
 
 function resolveEnvCookieFile(): string | undefined {
   const envCookiePath = process.env.YOUTUBE_COOKIES_PATH?.trim();
@@ -88,6 +96,15 @@ function sanitizeFilename(input: string): string {
   return (cleaned || 'video').slice(0, 72);
 }
 
+function isYtdlpUnavailableError(message: string): boolean {
+  const lower = message.toLowerCase();
+  return (
+    isBotCheckError(message) ||
+    lower.includes('enoent') ||
+    lower.includes('spawn yt-dlp')
+  );
+}
+
 function runYtdlpMetadata(
   url: string,
   cookiePath?: string,
@@ -105,7 +122,7 @@ function runYtdlpMetadata(
     }
     args.push(url);
 
-    const child = spawn('yt-dlp', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(resolveYtdlpBinary(), args, { stdio: ['ignore', 'pipe', 'pipe'] });
 
     let stdout = '';
     let stderr = '';
@@ -213,6 +230,12 @@ function startFfmpegMuxJob(
         ffErr += chunk.toString('utf8');
       });
 
+      ff.on('error', (err) => {
+        job.phase = 'error';
+        job.error = `FFmpeg failed to start: ${err.message}`;
+        job.statusLine = job.error;
+      });
+
       ff.on('close', (code) => {
         if (code === 0 && fs.existsSync(outFile)) {
           job.phase = 'completed';
@@ -227,7 +250,7 @@ function startFfmpegMuxJob(
         }
       });
     }
-  }, 220);
+  }, 200);
 }
 
 function startYtdlpDownloadJob(
@@ -260,10 +283,11 @@ function startYtdlpDownloadJob(
   }
   args.push(url);
 
-  const child = spawn('yt-dlp', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawn(resolveYtdlpBinary(), args, { stdio: ['ignore', 'pipe', 'pipe'] });
 
   let stderr = '';
   let stdoutBuf = '';
+  let handedOffToFallback = false;
 
   const processLine = (rawLine: string) => {
     const line = rawLine.trim();
@@ -302,7 +326,18 @@ function startYtdlpDownloadJob(
     stderr += chunk.toString('utf8');
   });
 
+  child.on('error', () => {
+    if (handedOffToFallback) {
+      return;
+    }
+    handedOffToFallback = true;
+    startFfmpegMuxJob(job, title, videoFormatId, audioFormatId);
+  });
+
   child.on('close', (code) => {
+    if (handedOffToFallback) {
+      return;
+    }
     if (stdoutBuf) {
       processLine(stdoutBuf);
     }
@@ -330,7 +365,8 @@ function startYtdlpDownloadJob(
       `yt-dlp exited with code ${code}`
     ).replace(/^ERROR:\s*/i, '');
 
-    if (isBotCheckError(cleanErr)) {
+    if (isYtdlpUnavailableError(cleanErr)) {
+      handedOffToFallback = true;
       startFfmpegMuxJob(job, title, videoFormatId, audioFormatId);
       return;
     }
@@ -379,9 +415,8 @@ async function createServer() {
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Failed to extract video info.';
-      const botCheck = isBotCheckError(message);
 
-      if (botCheck) {
+      if (isYtdlpUnavailableError(message)) {
         if (matchedSample) {
           res.json({
             title: matchedSample.title,
@@ -476,7 +511,10 @@ async function createServer() {
       res.status(404).json({ error: 'Merged MP4 file is not ready.' });
       return;
     }
-    res.download(job.filePath, job.fileName || 'video.mp4');
+    const safeDownloadName = sanitizeFilename((job.fileName || 'video.mp4').replace(/\.mp4$/i, '')) + '.mp4';
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Content-Disposition', `attachment; filename="${safeDownloadName}"`);
+    res.sendFile(job.filePath);
   });
 
   if (process.env.NODE_ENV !== 'production') {

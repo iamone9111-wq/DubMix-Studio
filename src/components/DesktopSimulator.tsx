@@ -67,13 +67,30 @@ export function DesktopSimulator() {
     }
   };
 
-  const triggerBrowserDownload = (fileUrl: string, fileName: string) => {
-    const anchor = document.createElement('a');
-    anchor.href = fileUrl;
-    anchor.download = fileName;
-    document.body.appendChild(anchor);
-    anchor.click();
-    anchor.remove();
+  const triggerBrowserDownload = async (fileUrl: string, fileName: string) => {
+    try {
+      const response = await fetch(fileUrl);
+      if (!response.ok) {
+        throw new Error('Download endpoint returned an error.');
+      }
+      const blob = await response.blob();
+      const blobUrl = URL.createObjectURL(blob);
+      setCompletedFileUrl(blobUrl);
+      const anchor = document.createElement('a');
+      anchor.href = blobUrl;
+      anchor.download = fileName;
+      anchor.rel = 'noopener';
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+    } catch {
+      const anchor = document.createElement('a');
+      anchor.href = fileUrl;
+      anchor.download = fileName;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+    }
   };
 
   const handleFetchInfo = async () => {
@@ -87,6 +104,9 @@ export function DesktopSimulator() {
     }
 
     setErrorMessage('');
+    if (completedFileUrl?.startsWith('blob:')) {
+      URL.revokeObjectURL(completedFileUrl);
+    }
     setCompletedFileUrl(null);
     setCompletedFileName(null);
     setPhase('fetching');
@@ -151,6 +171,9 @@ export function DesktopSimulator() {
     }
     stopPolling();
     setErrorMessage('');
+    if (completedFileUrl?.startsWith('blob:')) {
+      URL.revokeObjectURL(completedFileUrl);
+    }
     setCompletedFileUrl(null);
     setCompletedFileName(null);
     setPhase('downloading');
@@ -204,7 +227,7 @@ export function DesktopSimulator() {
             const fileName = job.fileName || 'video.mp4';
             setCompletedFileUrl(fileUrl);
             setCompletedFileName(fileName);
-            triggerBrowserDownload(fileUrl, fileName);
+            await triggerBrowserDownload(fileUrl, fileName);
           } else if (job.phase === 'error') {
             stopPolling();
             setPhase('error');
@@ -217,7 +240,7 @@ export function DesktopSimulator() {
           setPhase('error');
           setErrorMessage('Connection interrupted while checking download progress.');
         }
-      }, 250);
+      }, 220);
     } catch {
       setPhase('error');
       setErrorMessage('Unable to start download.');
